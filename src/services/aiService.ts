@@ -18,6 +18,60 @@ export interface ColdMessageResult {
   coldMessages: ColdMessageTemplates;
 }
 
+const MAX_AI_OUTPUT_ITEMS = 50;
+const MAX_AI_OUTPUT_LENGTH = 10000;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const isStringArray = (value: unknown): value is string[] =>
+  Array.isArray(value)
+  && value.length <= MAX_AI_OUTPUT_ITEMS
+  && value.every((item) => typeof item === 'string' && item.length <= MAX_AI_OUTPUT_LENGTH);
+
+const isParseResult = (value: unknown): value is ParseJdResult =>
+  isRecord(value)
+  && isStringArray(value.parsedCompetencies)
+  && typeof value.requiredExperience === 'string'
+  && value.requiredExperience.length <= MAX_AI_OUTPUT_LENGTH;
+
+const isInterviewPrepResult = (value: unknown): value is InterviewPrepResult =>
+  isRecord(value) && isStringArray(value.questions);
+
+const isColdMessageResult = (value: unknown): value is ColdMessageResult => {
+  if (!isRecord(value)) return false;
+  const messages = value.coldMessages;
+  if (!isRecord(messages)) return false;
+  return ['recruiter', 'hiringManager', 'peer'].every((key) => {
+    const message = messages[key];
+    return message === undefined || (typeof message === 'string' && message.length <= MAX_AI_OUTPUT_LENGTH);
+  });
+};
+
+const parseJsonContent = (value: unknown): unknown => {
+  if (typeof value !== 'string') throw new Error('AI provider returned non-text content.');
+  return JSON.parse(value) as unknown;
+};
+
+const getOpenAiContent = (value: unknown): unknown => {
+  if (!isRecord(value) || !Array.isArray(value.choices) || !isRecord(value.choices[0])) {
+    throw new Error('AI provider returned an invalid response shape.');
+  }
+  const message = value.choices[0].message;
+  if (!isRecord(message)) throw new Error('AI provider returned an invalid message shape.');
+  return parseJsonContent(message.content);
+};
+
+const getOllamaContent = (value: unknown): unknown => {
+  if (!isRecord(value)) throw new Error('AI provider returned an invalid response shape.');
+  return parseJsonContent(value.response);
+};
+
+const readJsonResponse = async (response: Response): Promise<unknown> => {
+  if (!response.ok) throw new Error(`AI provider request failed with status ${response.status}.`);
+  return response.json() as Promise<unknown>;
+};
+
 export class AiService {
   /**
    * Parse Job Description text into core technical competencies and required experience.
@@ -201,12 +255,9 @@ export class AiService {
           response_format: { type: 'json_object' },
         }),
       });
-      const data = await res.json();
-      const content = JSON.parse(data.choices[0].message.content);
-      return {
-        parsedCompetencies: content.parsedCompetencies || [],
-        requiredExperience: content.requiredExperience || '3+ years experience',
-      };
+      const content = getOpenAiContent(await readJsonResponse(res));
+      if (!isParseResult(content)) throw new Error('AI provider returned an invalid JD analysis.');
+      return content;
     } catch (e) {
       console.warn('OpenAI API call failed, falling back to offline engine:', e);
       return this.parseJdOffline(jdText, []);
@@ -242,9 +293,9 @@ export class AiService {
           response_format: { type: 'json_object' },
         }),
       });
-      const data = await res.json();
-      const content = JSON.parse(data.choices[0].message.content);
-      return { questions: content.questions || [] };
+      const content = getOpenAiContent(await readJsonResponse(res));
+      if (!isInterviewPrepResult(content)) throw new Error('AI provider returned invalid interview questions.');
+      return content;
     } catch (e) {
       console.warn('OpenAI API call failed, falling back to offline engine:', e);
       return this.generateQuestionsOffline(title, company, techStack, jdText);
@@ -274,12 +325,9 @@ export class AiService {
           format: 'json',
         }),
       });
-      const data = await res.json();
-      const content = JSON.parse(data.response);
-      return {
-        parsedCompetencies: content.parsedCompetencies || [],
-        requiredExperience: content.requiredExperience || '',
-      };
+      const content = getOllamaContent(await readJsonResponse(res));
+      if (!isParseResult(content)) throw new Error('AI provider returned an invalid JD analysis.');
+      return content;
     } catch (e) {
       console.warn('Ollama endpoint call failed, falling back to offline engine:', e);
       return this.parseJdOffline(jdText, []);
@@ -300,9 +348,9 @@ export class AiService {
           format: 'json',
         }),
       });
-      const data = await res.json();
-      const content = JSON.parse(data.response);
-      return { questions: content.questions || [] };
+      const content = getOllamaContent(await readJsonResponse(res));
+      if (!isInterviewPrepResult(content)) throw new Error('AI provider returned invalid interview questions.');
+      return content;
     } catch (e) {
       console.warn('Ollama call failed, falling back to offline engine:', e);
       return this.generateQuestionsOffline(title, company, techStack, jdText);
@@ -339,9 +387,9 @@ export class AiService {
           response_format: { type: 'json_object' },
         }),
       });
-      const data = await res.json();
-      const content = JSON.parse(data.choices[0].message.content);
-      return { coldMessages: content.coldMessages };
+      const content = getOpenAiContent(await readJsonResponse(res));
+      if (!isColdMessageResult(content)) throw new Error('AI provider returned invalid outreach messages.');
+      return content;
     } catch (e) {
       return this.generateColdMessagesOffline(title, company, techStack, userResumeNotes, referralName);
     }

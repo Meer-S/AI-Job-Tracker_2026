@@ -162,22 +162,17 @@ export const App: React.FC = () => {
 
   const handleImportJSON = async (file: File, overwrite: boolean) => {
     try {
-      const reader = new FileReader();
-      reader.onload = async (e) => {
-        const text = e.target?.result as string;
-        const data = JSON.parse(text);
-        if (data.jobs && Array.isArray(data.jobs)) {
-          await bulkImportJobs(data.jobs, overwrite);
-          await fetchJobs();
-          alert(`Successfully imported ${data.jobs.length} job cards!`);
-        } else {
-          alert('Invalid backup JSON format.');
-        }
-      };
-      reader.readAsText(file);
+      const text = await file.text();
+      const data: unknown = JSON.parse(text);
+      if (!data || typeof data !== 'object' || !('jobs' in data) || !Array.isArray(data.jobs)) {
+        throw new Error('Invalid backup JSON format.');
+      }
+      await bulkImportJobs(data.jobs, overwrite);
+      await fetchJobs();
+      alert(`Successfully imported ${data.jobs.length} job cards!`);
     } catch (err) {
       console.error('Import failed', err);
-      alert('Failed to parse backup JSON file.');
+      alert(err instanceof Error ? err.message : 'Failed to import backup JSON file.');
     }
   };
 

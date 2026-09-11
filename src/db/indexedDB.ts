@@ -1,5 +1,5 @@
 import { openDB, DBSchema, IDBPDatabase } from 'idb';
-import { Job, AiSettings } from '../types/job';
+import { AiSettings, Job, JobStatus, WorkMode } from '../types/job';
 
 interface JobTrackerDB extends DBSchema {
   jobs: {
@@ -11,6 +11,11 @@ interface JobTrackerDB extends DBSchema {
 
 const DB_NAME = 'AI_JobTracker_DB';
 const DB_VERSION = 1;
+const JOB_STATUSES: JobStatus[] = ['bookmarked', 'applied', 'screening', 'interviewing', 'offered', 'rejected', 'archived'];
+const WORK_MODES: WorkMode[] = ['Remote', 'Hybrid', 'Onsite', 'Relocation Required'];
+const MAX_IMPORTED_STRING_LENGTH = 10000;
+const MAX_IMPORTED_ARRAY_LENGTH = 500;
+const AI_PROVIDERS = ['offline', 'openai', 'anthropic', 'ollama'] as const;
 
 let dbPromise: Promise<IDBPDatabase<JobTrackerDB>> | null = null;
 
@@ -294,7 +299,113 @@ export const deleteJob = async (id: string): Promise<void> => {
   await db.delete('jobs', id);
 };
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const isOptionalString = (value: unknown): value is string | undefined =>
+  value === undefined || (typeof value === 'string' && value.length <= MAX_IMPORTED_STRING_LENGTH);
+
+const isStringArray = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.length <= MAX_IMPORTED_ARRAY_LENGTH && value.every(
+    (item) => typeof item === 'string' && item.length <= MAX_IMPORTED_STRING_LENGTH
+  );
+
+const isAiProvider = (value: unknown): value is AiSettings['provider'] =>
+  typeof value === 'string' && AI_PROVIDERS.includes(value as AiSettings['provider']);
+
+const normalizeAiSettings = (value: unknown): AiSettings => {
+  const settings = isRecord(value) ? value : {};
+  const provider = isAiProvider(settings.provider) ? settings.provider : 'offline';
+  const apiKey = typeof settings.apiKey === 'string' && settings.apiKey.length <= MAX_IMPORTED_STRING_LENGTH
+    ? settings.apiKey
+    : undefined;
+  const ollamaUrl = typeof settings.ollamaUrl === 'string' && settings.ollamaUrl.length <= 2048
+    ? settings.ollamaUrl
+    : 'http://localhost:11434';
+  const modelName = typeof settings.modelName === 'string' && settings.modelName.length <= 200
+    ? settings.modelName
+    : 'llama3';
+
+  return { provider, apiKey, ollamaUrl, modelName };
+};
+
+const isTimeline = (value: unknown): boolean =>
+  Array.isArray(value) && value.length <= MAX_IMPORTED_ARRAY_LENGTH && value.every((event) => {
+    if (!isRecord(event)) return false;
+    return typeof event.id === 'string'
+      && typeof event.timestamp === 'string'
+      && typeof event.toStatus === 'string'
+      && JOB_STATUSES.includes(event.toStatus as JobStatus)
+      && (event.fromStatus === undefined || JOB_STATUSES.includes(event.fromStatus as JobStatus))
+      && isOptionalString(event.note);
+  });
+
+const isInterviewPipeline = (value: unknown): boolean =>
+  Array.isArray(value) && value.length <= MAX_IMPORTED_ARRAY_LENGTH && value.every((milestone) => {
+    if (!isRecord(milestone)) return false;
+    return typeof milestone.id === 'string'
+      && typeof milestone.stage === 'string'
+      && typeof milestone.completed === 'boolean'
+      && isOptionalString(milestone.date)
+      && isOptionalString(milestone.notes);
+  });
+
+const isOptionalRecord = (value: unknown, fields: Record<string, (field: unknown) => boolean>): boolean => {
+  if (value === undefined) return true;
+  if (!isRecord(value)) return false;
+  return Object.entries(fields).every(([field, validator]) => validator(value[field]));
+};
+
+export const isValidJob = (value: unknown): value is Job => {
+  if (!isRecord(value)) return false;
+  if (typeof value.id !== 'string' || value.id.length === 0 || value.id.length > MAX_IMPORTED_STRING_LENGTH) return false;
+  if (typeof value.company !== 'string' || value.company.length === 0 || value.company.length > MAX_IMPORTED_STRING_LENGTH) return false;
+  if (typeof value.title !== 'string' || value.title.length === 0 || value.title.length > MAX_IMPORTED_STRING_LENGTH) return false;
+  if (typeof value.status !== 'string' || !JOB_STATUSES.includes(value.status as JobStatus)) return false;
+  if (!isStringArray(value.techStack) || typeof value.workMode !== 'string' || !WORK_MODES.includes(value.workMode as WorkMode)) return false;
+  if (!isOptionalString(value.url) || !isOptionalString(value.location)) return false;
+  if (!isTimeline(value.timeline) || !isInterviewPipeline(value.interviewPipeline)) return false;
+  if (typeof value.appliedDate !== 'string' || typeof value.updatedAt !== 'string') return false;
+  if (!isOptionalRecord(value.referral, {
+    name: isOptionalString,
+    contact: isOptionalString,
+    lastPingedDate: isOptionalString,
+  })) return false;
+  if (!isOptionalRecord(value.assets, {
+    resumeVersion: isOptionalString,
+    portfolioUrl: isOptionalString,
+    coverLetterUrl: isOptionalString,
+    notes: isOptionalString,
+  })) return false;
+  if (!isOptionalRecord(value.financials, {
+    salaryRange: isOptionalString,
+    baseSalary: (field) => field === undefined || (typeof field === 'number' && Number.isFinite(field)),
+    bonus: (field) => field === undefined || (typeof field === 'number' && Number.isFinite(field)),
+    currency: isOptionalString,
+  })) return false;
+  if (!isOptionalRecord(value.aiData, {
+    rawJd: isOptionalString,
+    parsedCompetencies: (field) => field === undefined || isStringArray(field),
+    requiredExperience: isOptionalString,
+    generatedQuestions: (field) => field === undefined || isStringArray(field),
+    coldMessages: (field) => isOptionalRecord(field, {
+      recruiter: isOptionalString,
+      hiringManager: isOptionalString,
+      peer: isOptionalString,
+    }),
+    lastAnalyzedAt: isOptionalString,
+  })) return false;
+  return true;
+};
+
 export const bulkImportJobs = async (jobs: Job[], overwrite = false): Promise<void> => {
+  if (!Array.isArray(jobs) || jobs.some((job) => !isValidJob(job))) {
+    throw new Error('Backup contains one or more invalid job records.');
+  }
+  const jobIds = new Set(jobs.map((job) => job.id));
+  if (jobIds.size !== jobs.length) {
+    throw new Error('Backup contains duplicate job IDs.');
+  }
   const db = await getDB();
   const tx = db.transaction('jobs', 'readwrite');
   if (overwrite) {
@@ -308,12 +419,12 @@ export const bulkImportJobs = async (jobs: Job[], overwrite = false): Promise<vo
 
 export const exportAllData = async (): Promise<string> => {
   const jobs = await getAllJobs();
-  const settings = getAiSettings();
+  const { apiKey: _apiKey, ...safeSettings } = getAiSettings();
   const backup = {
     version: 1,
     exportedAt: new Date().toISOString(),
     jobs,
-    settings,
+    settings: safeSettings,
   };
   return JSON.stringify(backup, null, 2);
 };
@@ -324,7 +435,7 @@ const AI_SETTINGS_KEY = 'ai_job_tracker_settings';
 export const getAiSettings = (): AiSettings => {
   try {
     const raw = localStorage.getItem(AI_SETTINGS_KEY);
-    if (raw) return JSON.parse(raw);
+    if (raw) return normalizeAiSettings(JSON.parse(raw));
   } catch (e) {
     console.error('Failed to read AI settings', e);
   }
@@ -337,7 +448,7 @@ export const getAiSettings = (): AiSettings => {
 
 export const saveAiSettings = (settings: AiSettings): void => {
   try {
-    localStorage.setItem(AI_SETTINGS_KEY, JSON.stringify(settings));
+    localStorage.setItem(AI_SETTINGS_KEY, JSON.stringify(normalizeAiSettings(settings)));
   } catch (e) {
     console.error('Failed to save AI settings', e);
   }
